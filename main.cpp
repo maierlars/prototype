@@ -34,6 +34,21 @@ void RegisterRestHandler(HttpServer& server, std::unique_ptr<rocksdb::DB> const&
           response->write(SimpleWeb::StatusCode::server_error_internal_server_error);
         }
       };
+
+  server.resource["^/document/([^/]+)"]["POST"] =
+      [&](std::shared_ptr<HttpServer::Response> response,
+          std::shared_ptr<HttpServer::Request> request) {
+        auto key = request->path_match[1].str();
+        auto value = request->content.string();
+        rocksdb::WriteOptions opts;
+        opts.sync = true;
+        auto status = db->Put(opts, rocksdb::Slice(key), rocksdb::Slice(value));
+        if(status.ok()) {
+          response->write(SimpleWeb::StatusCode::success_ok, value);
+        } else {
+          response->write(SimpleWeb::StatusCode::server_error_internal_server_error);
+        }
+      };
 }
 
 int main() {
