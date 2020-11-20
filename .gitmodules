@@ -1,0 +1,12 @@
+[submodule "rocksdb"]
+	path = rocksdb
+	url = https://github.com/facebook/rocksdb
+[submodule "velocypack"]
+	path = velocypack
+	url = https://github.com/arangodb/velocypack
+[submodule "simple-web-server"]
+	path = simple-web-server
+	url = https://github.com/eidheim/Simple-Web-Server.git
+[submodule "asio"]
+	path = asio
+	url = https://github.com/chriskohlhoff/asio.git
