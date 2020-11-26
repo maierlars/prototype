@@ -10,3 +10,9 @@
 [submodule "asio"]
 	path = asio
 	url = https://github.com/chriskohlhoff/asio.git
+[submodule "function2"]
+	path = function2
+	url = https://github.com/Naios/function2.git
+[submodule "immer"]
+	path = immer
+	url = https://github.com/arximboldi/immer.git
