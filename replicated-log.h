@@ -13,9 +13,11 @@
 #include <velocypack/Iterator.h>
 #include <velocypack/Slice.h>
 #include <velocypack/velocypack-aliases.h>
+#include <iostream>
 
 #include "futures.h"
 #include "priority-queue.h"
+#include "scheduler.h"
 
 namespace rlog {
 
@@ -85,7 +87,7 @@ struct AppendEntriesResult {
     success = slice.get("success").isTrue();
   }
 
-  void intoBuilder(VPackBuilder &builder) const {
+  void intoBuilder(VPackBuilder& builder) const {
     VPackObjectBuilder ob(&builder);
     builder.add("term", VPackValue(term));
     builder.add("success", VPackValue(success));
@@ -174,8 +176,12 @@ struct ParticipantAPI {
 };
 
 struct Participant {
+  explicit Participant(std::shared_ptr<ParticipantAPI> api)
+      : api(std::move(api)) {}
+
   std::shared_ptr<ParticipantAPI> api;
-  log_index_type index;
+  log_index_type index = 0;
+  bool replicationOngoing = false;
 };
 
 struct ReplicatedLogReplicatorAPI {
@@ -183,49 +189,78 @@ struct ReplicatedLogReplicatorAPI {
   virtual auto getCommitIndex() -> log_index_type = 0;
   virtual void updateCommitIndex(log_index_type) = 0;
   virtual auto getLogEntry(log_index_type) -> LogEntry = 0;
-  virtual auto getLogFrom(log_index_type) -> std::pair<immer::box<LogEntry>, std::unique_ptr<LogIterator>> = 0;
+  virtual auto getLogFrom(log_index_type)
+      -> std::pair<immer::box<LogEntry>, std::unique_ptr<LogIterator>> = 0;
 };
 
-struct ReplicatedLog final : ReplicatedLogTrxAPI,
-                             ReplicatedLogLeadershipAPI,
-                             ReplicatedLogReplicationAPI,
-                             ReplicatedLogReplicatorAPI {
+struct ReplicatedLog final : ReplicatedLogTrxAPI, ReplicatedLogLeadershipAPI, ReplicatedLogReplicationAPI {
+  explicit ReplicatedLog(std::vector<std::shared_ptr<ParticipantAPI>> const& parts,
+                         std::shared_ptr<sched::scheduler> scheduler)
+      : scheduler(std::move(scheduler)) {
+    std::transform(parts.begin(), parts.end(), std::back_inserter(participants),
+                   [](std::shared_ptr<ParticipantAPI> const& api) {
+                     return Participant{api};
+                   });
+  }
+
   auto insert(VPackBufferUInt8 payload) -> std::pair<log_index_type, log_term_type> override {
     std::unique_lock guard(_mutex);
     if (!is_leader) {
       throw std::logic_error("not a leader");
     }
 
+    std::cout << "Inserting " << currentIndex + 1 << " " << currentTerm << " "
+              << VPackSlice(payload.data()).toJson() << std::endl;
+
     _log = std::move(_log).push_back({currentIndex + 1, currentTerm, std::move(payload)});
     currentIndex += 1;
+
+    triggerReplication();
     return std::make_pair(currentIndex, currentTerm);
   }
 
   auto waitFor(log_index_type index, log_term_type term)
       -> futures::future<WaitResult> override {
+    std::unique_lock guard(_mutex);
     if (!is_leader) {
       throw std::logic_error("not a leader");
     }
 
-    auto&& [f, p] = futures::make_promise<WaitResult>();
-    notifications.emplace(index, term, std::move(p));
-    return std::move(f).then_value([term](WaitResult&& result) {
-      if (result.term != term) {
-        throw std::logic_error("index has wrong term");
-      }
-      return result;
-    });
+    std::cout << "waiting for " << index << " " << term << std::endl;
+
+    return std::invoke([&] {
+             if (index <= commitIndex) {
+               std::cout << "wait condition already satsified" << std::endl;
+               return futures::make_fulfilled_promise<WaitResult>(
+                   std::in_place, _log[index - 1]->term);
+             }
+
+             auto&& [f, p] = futures::make_promise<WaitResult>();
+             notifications.emplace(index, term, std::move(p));
+             return std::move(f);
+           })
+        .then_value([term, index](WaitResult&& result) {
+          std::cout << "waiting completed " << index << " " << term
+                    << " with actual term " << result.term << std::endl;
+          if (result.term != term) {
+            throw std::logic_error("index has wrong term");
+          }
+          return result;
+        });
   }
 
   void assumeLeadership(log_term_type term) override {
     std::unique_lock guard(_mutex);
+    std::cout << "Assuming leadership for term " << term << std::endl;
     is_leader = true;
     currentTerm = term;
   }
 
   auto appendEntries(const AppendEntriesRequest& req) -> AppendEntriesResult override {
     std::unique_lock guard(_mutex);
-    if (is_leader && req.term >= currentTerm) {
+    std::cout << "received append entries with term " << req.term << " prevLog = ("
+              << req.prevLogIndex << " " << req.prevLogTerm << std::endl;
+    if (!is_leader && req.term >= currentTerm) {
       // update my term
       currentTerm = req.term;
       commitIndex = req.commitIndex;
@@ -241,39 +276,117 @@ struct ReplicatedLog final : ReplicatedLogTrxAPI,
             t.push_back(*opt);
           }
           _log = t.persistent();
+          std::cout << "appended entries" << std::endl;
           return {currentTerm, true};
+        } else {
+          std::cout << "term of prevlog index does not match " << entry->term << " != " << req.prevLogTerm << std::endl;
         }
+      } else {
+        std::cout << "prevlog index is after my log head" << _log.size() << std::endl;
       }
+    } else {
+      std::cout << "my term is higher " << currentTerm << std::endl;
     }
 
+    std::cout << "returning false to replication " << std::endl;
     return {currentTerm, false};
   }
 
-  void updateCommitIndex(log_index_type index) override {
-    std::unique_lock guard(_mutex);
-    assert(index > currentIndex);
+ private:
+  log_index_type quorumIndex(std::size_t quorum_size) const {
+    quorum_size = std::max(1ul, std::min(quorum_size, participants.size()));
+
+    std::vector<log_index_type> indexes;
+    std::transform(participants.begin(), participants.end(), std::back_inserter(indexes),
+                   [](Participant const& p) { return p.index; });
+    std::nth_element(indexes.begin(), indexes.begin() + (quorum_size - 1),
+                     indexes.end(), std::greater<log_index_type>{});
+    return indexes.at(quorum_size - 1);
+  }
+
+  void updateCommitIndex(log_index_type index) {
+    assert(index > commitIndex);
     currentIndex = index;
     while (!notifications.empty()) {
       if (notifications.find_max().index <= index) {
         auto&& top = notifications.extract_max();
-        std::move(top.promise).fulfill(std::in_place, _log[index]->term);
-        abort();
+        std::move(top.promise).fulfill(std::in_place, _log[index - 1]->term);
       } else {
         break;
       }
     }
   }
 
-  auto getLogFrom(log_index_type index) -> std::pair<immer::box<LogEntry>, std::unique_ptr<LogIterator>> override {
-    std::unique_lock guard(_mutex);
-    auto prevLogEntry = _log.at(index);
-    auto t = _log.transient();
-    t.drop(index);
-    t.take(500);
-    return {std::move(prevLogEntry), std::make_unique<Iterator>(t.persistent())};
+  void checkCommitIndex() {
+    auto index = quorumIndex(participants.size() / 2 + 1);
+    if (index > commitIndex) {
+      std::cout << "increment commit index to " << index << std::endl;
+      updateCommitIndex(index);
+    }
   }
 
- private:
+  void triggerReplication() noexcept {
+    for (auto&& p : participants) {
+      if (!p.replicationOngoing && p.index < currentIndex) {
+        startReplication(p);
+      }
+    }
+  }
+
+  futures::future<void> sendReplication(Participant& p) {
+    return futures::capture_into_future([&] {
+             std::unique_lock guard(_mutex);
+             auto const& prevLog = _log[p.index];
+
+             auto log = _log.drop(p.index);
+
+             auto req = AppendEntriesRequest(currentTerm, prevLog->index,
+                                             prevLog->term, commitIndex,
+                                             std::make_unique<Iterator>(log));
+
+             return p.api->appendEntries(req).then_value([log](rlog::AppendEntriesResult&& result) {
+               return std::make_tuple(result, log.size());
+             });
+           })
+        .then_value([this, &p](std::tuple<rlog::AppendEntriesResult, std::size_t>&& tup) {
+          std::unique_lock guard(_mutex);
+          auto&& [result, length] = tup;
+          if (result.success) {
+            p.index += length;
+            std::cout << "Participant is now at " << p.index << std::endl;
+            checkCommitIndex();
+            if (p.index < currentIndex) {
+              return sendReplication(p);
+            }
+          } else if (p.index > 0) {
+            p.index -= 1;
+          } else {
+            throw std::logic_error("follower does not accept any entries");
+          }
+
+          return futures::make_fulfilled_promise();
+        });
+  }
+
+  void startReplication(Participant& p) {
+    p.replicationOngoing = true;
+    scheduler
+        ->async([&]() -> futures::future<void> { return sendReplication(p); })
+        .finally([&](expect::expected<void>&& e) noexcept {
+          std::unique_lock guard(_mutex);
+          p.replicationOngoing = false;
+          std::cout << "stopping replication for one participant" << std::endl;
+          try {
+            e.rethrow_error();
+          } catch (std::exception const& ex) {
+            std::cout << "replication request ended with exception: " << ex.what()
+                      << std::endl;
+          } catch (...) {
+            std::cout << "replication request ended with unknown exception" << std::endl;
+          }
+        });
+  }
+
   struct NotifyRequest {
     NotifyRequest(log_index_type index_, log_term_type term_,
                   futures::promise<ReplicatedLogTrxAPI::WaitResult> promise_)
@@ -286,6 +399,8 @@ struct ReplicatedLog final : ReplicatedLogTrxAPI,
       return other.index < index;
     }
   };
+
+  static_assert(std::is_nothrow_move_assignable_v<NotifyRequest>);
 
   struct Iterator : LogIterator {
     using vector_type = immer::flex_vector<immer::box<LogEntry>>;
@@ -305,65 +420,17 @@ struct ReplicatedLog final : ReplicatedLogTrxAPI,
     vector_type::iterator iter;
   };
 
-  std::mutex _mutex;
+  std::mutex mutable _mutex;
   foobar::priority_queue<NotifyRequest> notifications;
   immer::flex_vector<immer::box<LogEntry>> _log;
+  std::vector<Participant> participants;
 
   log_index_type currentIndex = 0;
   log_term_type currentTerm = 0;
   log_index_type commitIndex = 0;
   bool is_leader = false;
+  std::shared_ptr<sched::scheduler> scheduler;
 };
 
-struct ReplicationThread {
-  explicit ReplicationThread(std::shared_ptr<ReplicatedLogReplicatorAPI> log,
-                             std::vector<std::shared_ptr<Participant>> parts,
-                             log_term_type currentTerm)
-      : log(std::move(log)), participants(std::move(parts)), currentTerm(currentTerm) {}
-
-  void stop() {
-    {
-      std::unique_lock guard(mutex);
-      is_stopping = true;
-      cv.notify_one();
-    }
-    thread.join();
-  }
-
-  void start() {
-    thread = std::thread([this] { this->run(); });
-  }
-
- private:
-  void run() noexcept {
-    std::unique_lock guard(mutex);
-    while (!is_stopping) {
-      for (auto&& participant : participants) {
-        auto&& [prevLogEntry, iterator] = log->getLogFrom(participant->index);
-
-        auto req = AppendEntriesRequest{
-            currentTerm,
-            participant->index,
-            prevLogEntry->term,
-            log->getCommitIndex(),
-            std::move(iterator)
-        };
-        participant->api->appendEntries(req);
-      }
-
-
-      cv.wait(guard);
-    }
-  }
-
-  bool is_stopping = false;
-
-  std::thread thread;
-  std::mutex mutex;
-  std::condition_variable cv;
-  std::shared_ptr<ReplicatedLogReplicatorAPI> log;
-  std::vector<std::shared_ptr<Participant>> participants;
-  log_term_type currentTerm;
-};
 }  // namespace rlog
 #endif  // PROTOTYPE_REPLICATED_LOG_H

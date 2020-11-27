@@ -15,6 +15,7 @@
 
 #include "futures.h"
 #include "replicated-log.h"
+#include "scheduler.h"
 
 using namespace futures;
 
@@ -81,7 +82,7 @@ struct DocumentAPI {
             return api->Get(request);
           }).finally([response = std::move(response)](expect::expected<std::optional<std::string>> v) noexcept {
             try {
-              if (auto value = v.get(); value) {
+              if (auto value = v.unwrap(); value) {
                 response->write(SimpleWeb::StatusCode::success_ok, value.value());
               } else {
                 response->write(SimpleWeb::StatusCode::client_error_not_found);
@@ -113,24 +114,93 @@ struct DocumentAPI {
 
 void RegisterReplicationHandler(HttpServer& server,
                                 std::shared_ptr<rlog::ReplicatedLogReplicationAPI> api) {
-
-  if (!api) { std::abort(); }
-
   server.resource["^/replication/([^/]+)/append-entries$"]["POST"] =
       [api](std::shared_ptr<HttpServer::Response> response,
             std::shared_ptr<HttpServer::Request> request) {
+        std::cout << "received append entries for log "
+                  << request->path_match[1] << std::endl;
+        futures::capture_into_future([&] {
+          VPackBuilder builder;
+          {
+            VPackParser parser(builder);
+            parser.parse(request->content.string());
+          }
 
-        VPackBuilder builder;
-        {
-          VPackParser parser(builder);
-          parser.parse(request->content.string());
-        }
-
-        auto result = api->appendEntries(rlog::AppendEntriesRequest{builder.slice()});
-        builder.clear();
-        result.intoBuilder(builder);
-        response->write(SimpleWeb::StatusCode::success_ok, builder.toJson());
+          return api->appendEntries(rlog::AppendEntriesRequest{builder.slice()});
+        }).finally([response](auto&& e) noexcept {
+          try {
+            VPackBuilder builder;
+            e.unwrap().intoBuilder(builder);
+            response->write(SimpleWeb::StatusCode::success_ok, builder.toJson());
+          } catch (std::exception const& ex) {
+            response->write(SimpleWeb::StatusCode::server_error_internal_server_error,
+                            ex.what());
+          } catch (...) {
+            response->write(SimpleWeb::StatusCode::server_error_internal_server_error);
+          }
+        });
       };
+}
+
+void RegisterLeadershipHandler(HttpServer& server,
+                               std::shared_ptr<rlog::ReplicatedLogLeadershipAPI> api) {
+  server.resource["^/assume-leadership$"]["POST"] =
+      [api](std::shared_ptr<HttpServer::Response> response,
+            std::shared_ptr<HttpServer::Request> request) {
+        futures::capture_into_future([api, request] {
+          VPackBuilder builder;
+          {
+            VPackParser parser(builder);
+            parser.parse(request->content.string());
+          }
+
+          api->assumeLeadership(builder.slice().get("term").getNumber<rlog::log_term_type>());
+        }).finally([response](expect::expected<void>&& e) noexcept {
+          try {
+            e.rethrow_error();
+            response->write(SimpleWeb::StatusCode::success_ok);
+          } catch (std::exception const& ex) {
+            response->write(SimpleWeb::StatusCode::server_error_internal_server_error,
+                            ex.what());
+          } catch (...) {
+            response->write(SimpleWeb::StatusCode::server_error_internal_server_error);
+          }
+        });
+      };
+}
+
+void RegisterAppendHandler(HttpServer& server,
+                           std::shared_ptr<rlog::ReplicatedLogTrxAPI> api) {
+  server.resource["^/append"]["POST"] = [api](std::shared_ptr<HttpServer::Response> response,
+                                              std::shared_ptr<HttpServer::Request> request) {
+    futures::capture_into_future([api, request] {
+      std::cout << "received append request from client" << std::endl;
+      VPackBufferUInt8 payload;
+      {
+        VPackBuilder builder(payload);
+
+        VPackParser parser(builder);
+        parser.parse(request->content.string());
+      }
+
+      auto [index, term] = api->insert(std::move(payload));
+
+      return api->waitFor(index, term);
+    }).finally([response = std::move(response)](expected<rlog::ReplicatedLogTrxAPI::WaitResult>&& e) noexcept {
+      if (e.has_error()) {
+        try {
+          std::rethrow_exception(e.error());
+        } catch (std::exception const& ex) {
+          response->write(SimpleWeb::StatusCode::server_error_internal_server_error,
+                          ex.what());
+        } catch (...) {
+          response->write(SimpleWeb::StatusCode::server_error_internal_server_error);
+        }
+      } else {
+        response->write(SimpleWeb::StatusCode::success_ok);
+      }
+    });
+  };
 }
 
 struct SimpleDocumentAPI : DocumentAPI {
@@ -142,9 +212,6 @@ struct SimpleDocumentAPI : DocumentAPI {
   futures::future<std::optional<std::string>> Put(DocumentPutRequest request) override {}
   futures::future<std::optional<std::string>> Delete(DocumentRequest request) override {}
 };
-
-void RegisterReplicationRestHandler(HttpServer& server,
-                                    std::shared_ptr<Context> const& ctx) {}
 
 struct HTTPError : std::exception {
   explicit HTTPError(SimpleWeb::error_code error) : error(error) {}
@@ -158,7 +225,7 @@ struct HTTPError : std::exception {
 
 struct RemoteLogParticipant : rlog::ParticipantAPI {
   explicit RemoteLogParticipant(std::string const& endpoint)
-      : client(endpoint) {}
+      : client(endpoint), endpoint(endpoint) {}
 
   futures::future<rlog::AppendEntriesResult> appendEntries(const rlog::AppendEntriesRequest& req) override {
     std::string body;
@@ -177,37 +244,38 @@ struct RemoteLogParticipant : rlog::ParticipantAPI {
     auto [f, p] = futures::make_promise<rlog::AppendEntriesResult>();
     auto ctx = std::make_shared<Context>(std::move(p));
 
+    std::cout << "Replicating to " << endpoint << std::endl;
     client.request("POST", "/replication/" + logIdentifier + "/append-entries", body,
                    [ctx](std::shared_ptr<HttpClient::Response> resp,
                          const SimpleWeb::error_code& err) mutable noexcept {
+                     std::cout << "replication request returned " << err << std::endl;
+
                      if (err) {
-                       std::move(ctx->p).except<HTTPError>(err);
+                       std::move(ctx->p).throw_into<HTTPError>(err);
                      } else {
                        std::move(ctx->p).capture([&]() -> rlog::AppendEntriesResult {
-                         if (resp->status_code == "200" ||
-                             resp->status_code == "403") {
-                           VPackBufferUInt8 buffer;
-                           {
-                             VPackBuilder builder(buffer);
-                             VPackParser parser(builder);
-                             parser.parse(resp->content.string());
-                           }
+                         VPackBufferUInt8 buffer;
+                         {
+                           auto str = resp->content.string();
+                           VPackBuilder builder(buffer);
+                           VPackParser parser(builder);
+                           parser.parse(str);
 
-                           VPackSlice slice(buffer.data());
-                           return rlog::AppendEntriesResult(slice);
-                         } else {
-                           throw std::logic_error(
-                               "unexpected http status code");
+                           std::cout << "response for replication is " << str << std::endl;
                          }
+
+                         VPackSlice slice(buffer.data());
+                         return rlog::AppendEntriesResult(slice);
                        });
                      }
                    });
-
+    client.io_service->run();
     return std::move(f);
   }
 
-  std::string logIdentifier;
+  std::string logIdentifier = "abc";
   HttpClient client;
+  std::string endpoint;
 };
 
 struct LocalLogParticipant : rlog::ParticipantAPI {
@@ -221,6 +289,8 @@ struct LocalLogParticipant : rlog::ParticipantAPI {
       key << key_prefix;
       key << std::setw(16) << std::setfill('0') << std::hex << e->get().index;
 
+      std::cout << "Writing " << e->get().index << " " << e->get().term << std::endl;
+
       batch.Put(key.str(),
                 rocksdb::Slice(reinterpret_cast<const char*>(e->get().payload.data()),
                                e->get().payload.size()));
@@ -228,7 +298,7 @@ struct LocalLogParticipant : rlog::ParticipantAPI {
     rocksdb::WriteOptions write_opts;
     write_opts.sync = true;  // can we do this async?
     db->Write(write_opts, &batch);
-
+    std::cout << "Sync done" << std::endl;
     return futures::make_fulfilled_promise<rlog::AppendEntriesResult>(std::in_place,
                                                                       req.term, true);
   }
@@ -238,18 +308,54 @@ struct LocalLogParticipant : rlog::ParticipantAPI {
   std::shared_ptr<rocksdb::DB> db;
 };
 
-int main() {
+int main(int argc, char* argv[]) {
+  if (argc < 3) {
+    std::cout << "expected at least one parameter" << std::endl;
+  }
+
   std::cout << "trollolol" << std::endl;
   auto ctx = std::make_shared<Context>();
-  ctx->db = OpenRocksDB("db");
+  std::cout << "opening rocksdb at " << argv[1] << std::endl;
+  ctx->db = OpenRocksDB(argv[1]);
+
+  std::cout << "listening at port " << argv[2] << std::endl;
 
   HttpServer server;
-  server.config.port = 8080;
+  server.config.port = std::atoi(argv[2]);
 
-  auto rlog = std::make_shared<rlog::ReplicatedLog>();
-  RegisterReplicationHandler(server, rlog);
+  // auto rlog = std::make_shared<rlog::ReplicatedLog>();
+  // RegisterReplicationHandler(server, rlog);
 
-  (void) rlog;
+  auto scheduler = std::make_shared<sched::scheduler>();
+
+  using namespace std::chrono_literals;
+
+  scheduler
+      ->delay(
+          5s, [](int x) { return 2 * x; }, 12)
+      .finally([](expected<int>&& e) noexcept {
+        std::cout << e.unwrap() << std::endl;
+      });
+
+  std::vector<std::shared_ptr<rlog::ParticipantAPI>> parts;
+
+  for (size_t i = 3; i < argc; i++) {
+    std::cout << "adding " << argv[i] << " as participant" << std::endl;
+    parts.push_back(std::make_shared<RemoteLogParticipant>(argv[i]));
+  }
+
+  parts.push_back(std::make_shared<LocalLogParticipant>("log/", ctx->db));
+  auto log = std::make_shared<rlog::ReplicatedLog>(parts, scheduler);
+
+  RegisterAppendHandler(server, log);
+  RegisterReplicationHandler(server, log);
+  RegisterLeadershipHandler(server, log);
+
+  constexpr auto number_of_threads = 2;
+  std::vector<std::thread> threads(number_of_threads);
+  for (size_t i = 0; i < number_of_threads; i++) {
+    threads.emplace_back([&] { scheduler->run(); });
+  }
 
   auto doc_api = std::make_shared<SimpleDocumentAPI>();
   DocumentAPI::RegisterHandler(server, doc_api);

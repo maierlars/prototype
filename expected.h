@@ -10,9 +10,9 @@ namespace expect {
 template <typename T>
 struct expected;
 
-template <typename F, typename... Args, std::enable_if_t<std::is_invocable_v<F, Args...>, int> = 0>
+template <typename F, typename... Args, std::enable_if_t<std::is_invocable_v<F, Args...>, int> = 0, typename R = std::invoke_result_t<F, Args...>>
 auto captured_invoke(F&& f, Args&&... args) noexcept
-    -> expected<std::invoke_result_t<F, Args...>>;
+    -> expected<R>;
 
 namespace detail {
 
@@ -72,7 +72,7 @@ struct expected : detail::expected_base<T> {
   expected(T t) : _value(std::move(t)), _has_value(true) {}
 
   template <typename... Ts, std::enable_if_t<std::is_constructible_v<T, Ts...>, int> = 0>
-  expected(std::in_place_t, Ts&&... ts)
+  explicit expected(std::in_place_t, Ts&&... ts)
       : _value(std::forward<Ts>(ts)...), _has_value(true) {}
 
   template <typename U = T, std::enable_if_t<std::is_move_constructible_v<U>, int> = 0>
@@ -99,19 +99,19 @@ struct expected : detail::expected_base<T> {
   expected& operator=(expected const&) = delete;
   expected& operator=(expected&&) noexcept = default;
 
-  T& get() & {
+  T& unwrap() & {
     if (_has_value) {
       return _value;
     }
     std::rethrow_exception(_exception);
   }
-  T const& get() const& {
+  T const& unwrap() const& {
     if (_has_value) {
       return _value;
     }
     std::rethrow_exception(_exception);
   }
-  T&& get() && {
+  T&& unwrap() && {
     if (_has_value) {
       return std::move(_value);
     }
@@ -125,8 +125,8 @@ struct expected : detail::expected_base<T> {
     return nullptr;
   }
 
-  T* operator->() { return &get(); }
-  T const* operator->() const { return &get(); }
+  T* operator->() { return &unwrap(); }
+  T const* operator->() const { return &unwrap(); }
 
   [[nodiscard]] bool has_value() const noexcept { return _has_value; }
   [[nodiscard]] bool has_error() const noexcept { return !has_value(); }
@@ -171,7 +171,7 @@ template <>
 struct expected<void> : detail::expected_base<void> {
   expected() = default;
   expected(std::exception_ptr p) : _exception(std::move(p)) {}
-  expected(std::in_place_t) : _exception(nullptr) {}
+  explicit expected(std::in_place_t) : _exception(nullptr) {}
   ~expected() = default;
 
   expected(expected const&) = delete;
@@ -194,11 +194,16 @@ struct expected<void> : detail::expected_base<void> {
   std::exception_ptr _exception = nullptr;
 };
 
-template <typename F, typename... Args, std::enable_if_t<std::is_invocable_v<F, Args...>, int>>
+template <typename F, typename... Args, std::enable_if_t<std::is_invocable_v<F, Args...>, int>, typename R>
 auto captured_invoke(F&& f, Args&&... args) noexcept
-    -> expected<std::invoke_result_t<F, Args...>> {
+    -> expected<R> {
   try {
-    return std::invoke(std::forward<F>(f), std::forward<Args>(args)...);
+    if constexpr (std::is_void_v<R>) {
+      std::invoke(std::forward<F>(f), std::forward<Args>(args)...);
+      return {};
+    } else {
+      return std::invoke(std::forward<F>(f), std::forward<Args>(args)...);
+    }
   } catch (...) {
     return std::current_exception();
   }

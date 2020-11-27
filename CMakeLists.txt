@@ -31,7 +31,8 @@ set(immer_BUILD_DOCS OFF CACHE BOOL "")
 set(immer_BUILD_EXTRAS OFF CACHE BOOL "")
 add_subdirectory(immer EXCLUDE_FROM_ALL)
 
-add_executable(prototype main.cpp futures.h replicated-log.cpp priority-queue.h)
+
+add_executable(prototype main.cpp futures.h replicated-log.cpp priority-queue.h scheduler.h)
 target_link_libraries(prototype velocypack)
 
 target_include_directories(prototype PRIVATE rocksdb/include)
@@ -41,3 +42,7 @@ target_link_libraries(prototype simple-web-server)
 
 target_link_libraries(prototype function2)
 target_link_libraries(prototype immer)
+
+
+target_compile_options(prototype PRIVATE "-fsanitize=address")
+target_link_libraries(prototype asan)

@@ -19,6 +19,7 @@ template <typename T>
 auto make_promise() -> std::pair<future<T>, promise<T>>;
 template <typename T>
 future<T> make_fulfilled_promise(expected<T> e);
+static future<void> make_fulfilled_promise();
 template <typename T, typename... Args, std::enable_if_t<std::is_constructible_v<T, Args...>, int> = 0>
 future<T> make_fulfilled_promise(std::in_place_t, Args&&...);
 template <typename T, typename E, typename... Args>
@@ -56,6 +57,8 @@ struct shared_state {
       : _state(state::VALUE) {
     new (&_store) expected<T>(std::in_place, std::forward<Args>(args)...);
   }
+  explicit shared_state(expected<T> e)
+      : _state(state::VALUE), _store(std::move(e)) {}
   explicit shared_state(std::exception_ptr ptr) : _state(state::VALUE) {
     new (&_store) expected<T>(std::move(ptr));
   }
@@ -183,7 +186,7 @@ struct future_base : detail::shared_base<T> {
         } else {
           auto state = std::move(r).get().extract();
           if (state == nullptr) {
-            std::move(p).template except<std::runtime_error>(
+            std::move(p).template throw_into<std::runtime_error>(
                 "future in bad state");
           } else {
             static_assert(std::is_same_v<decltype(p), promise<R>>);
@@ -203,8 +206,7 @@ struct future_base : detail::shared_base<T> {
     return std::move(ff);
   }
 
-  template <typename F, std::enable_if_t<std::is_nothrow_invocable_r_v<void, F, expected<T>&&>, int> = 0,
-            typename R = std::invoke_result_t<F, expected<T>&&>>
+  template <typename F, std::enable_if_t<std::is_nothrow_invocable_r_v<void, F, expected<T>&&>, int> = 0>
   void finally(F&& f) && {
     std::move(*this).use([f = std::forward<F>(f)](detail::shared_state<T>& state) mutable {
       std::move(state).set_callback(std::move(f));
@@ -212,9 +214,12 @@ struct future_base : detail::shared_base<T> {
   }
 };
 
-template<typename T>
+template <typename T>
 struct promise_base : shared_base<T> {
   using detail::shared_base<T>::shared_base;
+
+  promise_base(promise_base const&) = delete;
+  promise_base& operator=(promise_base const&) = delete;
 
   promise_base(promise_base&&) = default;
   promise_base& operator=(promise_base&&) = default;
@@ -229,15 +234,38 @@ struct promise_base : shared_base<T> {
         [&](detail::shared_state<T>& state) { state.set_value(std::move(v)); });
   }
 
-  template <typename F, typename... Args,
-      std::enable_if_t<std::is_invocable_r_v<T, F, Args...> || std::is_invocable_r_v<expected<T>, F, Args...>, int> = 0>
+  template <typename F, typename... Args, std::enable_if_t<std::is_invocable_v<F, Args...>, int> = 0,
+            typename R = std::invoke_result_t<F, Args...>,
+            std::enable_if_t<std::is_same_v<R, T> || std::is_same_v<R, expected<T>>, int> = 0>
   void capture(F&& f, Args&&... args) && noexcept {
     std::move(*this).fulfill(
         captured_invoke(std::forward<F>(f), std::forward<Args>(args)...));
   }
 
+  template <typename F, typename... Args,
+            std::enable_if_t<std::is_invocable_r_v<future<T>, F, Args...>, int> = 0>
+  void capture(F&& f, Args&&... args) && noexcept {
+    static_assert(std::is_void_v<T> || std::is_nothrow_move_constructible_v<T>);
+
+    detail::shared_state_ptr<T> shared;
+    try {
+      shared = std::invoke(std::forward<F>(f), std::forward<Args>(args)...).extract();
+    } catch (...) {
+      std::move(*this).fulfill(std::current_exception());
+    }
+
+    if (shared == nullptr) {
+      std::move(*this).template throw_into<std::logic_error>(
+          "invalid future state");
+    } else {
+      shared->set_callback([p = std::move(*this)](expected<T>&& e) mutable noexcept {
+        std::move(p).fulfill(std::move(e));
+      });
+    }
+  }
+
   template <typename E, typename... Args, std::enable_if_t<std::is_constructible_v<E, Args...>, int> = 0>
-  void except(Args&&... args) && noexcept {
+  void throw_into(Args&&... args) && noexcept {
     try {
       throw E(std::forward<Args>(args)...);
     } catch (...) {
@@ -258,18 +286,23 @@ struct future : detail::future_base<T> {
     auto [ff, p] = make_promise<R>();
     auto callback = [p = std::move(p), f = std::forward<F>(f)](expected<T>&& e) mutable noexcept {
       if (e.has_error()) {
-        std::move(p).fulfill(e.error());
+        try {
+          std::move(p).fulfill(e.error());
+          return;
+        } catch (...) {
+          std::abort();
+        }
       }
       if constexpr (is_future_v<S>) {
         // this is expected<future<R>>
-        auto r = captured_invoke(std::forward<F>(f), std::move(e).get());
+        auto r = captured_invoke(std::forward<F>(f), std::move(e).unwrap());
         if (r.has_error()) {
           // fulfill with this error
           std::move(p).fulfill(r.error());
         } else {
-          auto state = std::move(r).get().extract();
+          auto state = std::move(r).unwrap().extract();
           if (state == nullptr) {
-            std::move(p).template except<std::runtime_error>(
+            std::move(p).template throw_into<std::runtime_error>(
                 "future in bad state");
           } else {
             static_assert(std::is_same_v<decltype(p), promise<R>>);
@@ -279,7 +312,7 @@ struct future : detail::future_base<T> {
           }
         }
       } else {
-        std::move(p).capture(std::forward<F>(f), std::move(e).get());
+        std::move(p).capture(std::forward<F>(f), std::move(e).unwrap());
       }
     };
 
@@ -302,18 +335,17 @@ struct promise : detail::promise_base<T> {
 
   template <typename... Args, std::enable_if_t<std::is_constructible_v<T, Args...>, int> = 0>
   void fulfill(std::in_place_t, Args&&... args) && {
-    std::move(*this).fulfill({std::in_place, std::forward<Args>(args)...});
+    auto shared = std::move(*this).extract();
+    shared->set_value(std::in_place, std::forward<Args>(args)...);
   }
 };
 
-template<>
+template <>
 struct promise<void> : detail::promise_base<void> {
   using detail::promise_base<void>::promise_base;
   using detail::promise_base<void>::fulfill;
 
-  void fulfill() && {
-    std::move(*this).fulfill(expected<void>{});
-  }
+  void fulfill() && { std::move(*this).fulfill(expected<void>{}); }
 };
 
 static_assert(std::is_move_constructible_v<future<int>>);
@@ -328,6 +360,10 @@ std::pair<future<T>, promise<T>> make_promise() {
 template <typename T>
 future<T> make_fulfilled_promise(expected<T> e) {
   return detail::build_future(std::make_shared<detail::shared_state<T>>(std::move(e)));
+}
+
+static future<void> make_fulfilled_promise() {
+  return detail::build_future(std::make_shared<detail::shared_state<void>>(std::in_place));
 }
 
 template <typename T, typename... Args, std::enable_if_t<std::is_constructible_v<T, Args...>, int>>
@@ -357,6 +393,9 @@ auto capture_into_future(F&& f, Args&&... args) -> future<R> {
   try {
     if constexpr (is_future_v<S>) {
       return std::invoke(std::forward<F>(f), std::forward<Args>(args)...);
+    } else if constexpr (std::is_void_v<S>) {
+      std::invoke(std::forward<F>(f), std::forward<Args>(args)...);
+      return make_fulfilled_promise<void>({});
     } else {
       return make_fulfilled_promise<R>(
           std::invoke(std::forward<F>(f), std::forward<Args>(args)...));
