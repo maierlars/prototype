@@ -32,7 +32,7 @@ set(immer_BUILD_EXTRAS OFF CACHE BOOL "")
 add_subdirectory(immer EXCLUDE_FROM_ALL)
 
 
-add_executable(prototype main.cpp futures.h replicated-log.cpp priority-queue.h scheduler.h)
+add_executable(prototype main.cpp futures.h replicated-log.cpp priority-queue.h scheduler.h remote-procedure-call.h replicated-log-2.cpp replicated-log-2.h rocksdb-handle.cpp rocksdb-handle.h deserialize.h persisted-log.cpp persisted-log.h futures/futures-2.h)
 target_link_libraries(prototype velocypack)
 
 target_include_directories(prototype PRIVATE rocksdb/include)
@@ -46,3 +46,16 @@ target_link_libraries(prototype immer)
 
 target_compile_options(prototype PRIVATE "-fsanitize=address")
 target_link_libraries(prototype asan)
+
+
+add_executable(futures-2 futures/futures-2.cpp futures/box.h futures/continuation.h futures/helper.h futures/handler.h futures/base.h futures/devoidify.h)
+target_compile_options(futures-2 PRIVATE "-fsanitize=address")
+target_link_libraries(futures-2 asan)
+
+target_link_libraries(futures-2 pthread)
+
+
+find_package(Boost REQUIRED)
+add_executable(asio-test asio-test.cpp)
+target_link_libraries(asio-test ${Boost_LIBRARIES})
+target_link_libraries(asio-test pthread)

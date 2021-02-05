@@ -39,6 +39,7 @@ struct expected_base {
       std::rethrow_exception(self().error());
     }
   }
+
   template <typename E, typename F, std::enable_if_t<std::is_invocable_v<F, E const&>, int> = 0>
   auto catch_error(F&& f) -> std::optional<std::invoke_result_t<F, E const&>> {
     try {
@@ -53,8 +54,8 @@ struct expected_base {
   explicit operator bool() const noexcept { return self().has_error(); }
 
  private:
-  expected<T>& self() & { return static_cast<expected<T>*>(this); }
-  expected<T> const& self() const& {
+  [[nodiscard]] expected<T>& self() & { return static_cast<expected<T>*>(this); }
+  [[nodiscard]] expected<T> const& self() const& {
     return *static_cast<expected<T> const*>(this);
   }
 };

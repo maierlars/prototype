@@ -106,8 +106,8 @@ struct AppendEntriesRequest {
   std::unique_ptr<LogIterator> entries;
 
   AppendEntriesRequest(log_term_type term, log_index_type prevLogIndex,
-                       log_term_type prevLogTerm, log_index_type commitIndex,
-                       std::unique_ptr<LogIterator> entries)
+      log_term_type prevLogTerm, log_index_type commitIndex,
+      std::unique_ptr<LogIterator> entries)
       : term(term),
         prevLogIndex(prevLogIndex),
         prevLogTerm(prevLogTerm),

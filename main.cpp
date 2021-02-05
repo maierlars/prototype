@@ -5,112 +5,29 @@
 #include <mutex>
 #include <server_http.hpp>
 
-#include <rocksdb/db.h>
-#include <rocksdb/write_batch.h>
-
 #include <velocypack/vpack.h>
 
 #include <boost/lexical_cast.hpp>
 #include <utility>
 
+#include "rocksdb-handle.h"
 #include "futures.h"
 #include "replicated-log.h"
 #include "scheduler.h"
+
+#include "persisted-log.h"
 
 using namespace futures;
 
 using HttpServer = SimpleWeb::Server<SimpleWeb::HTTP>;
 using HttpClient = SimpleWeb::Client<SimpleWeb::HTTP>;
 
-std::shared_ptr<rocksdb::DB> OpenRocksDB(std::string const& dbname) {
-  rocksdb::DB* ptr;
-  rocksdb::Options opts;
-  opts.create_if_missing = true;
-  auto status = rocksdb::DB::Open(opts, dbname, &ptr);
-  if (!status.ok()) {
-    throw std::runtime_error(status.ToString());
-  }
-
-  return std::shared_ptr<rocksdb::DB>{ptr};
-}
 
 struct Context : std::enable_shared_from_this<Context> {
-  std::shared_ptr<rocksdb::DB> db;
+  std::shared_ptr<RocksDBHandle> rocks;
 };
 
 using TransactionId = uint64_t;
-
-struct DocumentAPI {
-  virtual ~DocumentAPI() = default;
-
-  struct DocumentRequest {
-    std::optional<TransactionId> transactionId;
-    std::string collectionName;
-    std::string key;
-
-    DocumentRequest(std::shared_ptr<HttpServer::Request> const& req) {
-      collectionName = req->path_match.operator[](0).str();
-      key = req->path_match.operator[](1).str();
-
-      if (auto it = req->header.find("Transaction-Id"); it != std::end(req->header)) {
-        transactionId = boost::lexical_cast<TransactionId>(it->second);
-      }
-    }
-  };
-
-  struct DocumentPutRequest : DocumentRequest {
-    std::string value;
-
-    DocumentPutRequest(std::shared_ptr<HttpServer::Request> const& req)
-        : DocumentRequest(req) {
-      value = req->content.string();
-    }
-  };
-
-  virtual auto Get(DocumentRequest request)
-      -> futures::future<std::optional<std::string>> = 0;
-  virtual auto Put(DocumentPutRequest request)
-      -> futures::future<std::optional<std::string>> = 0;
-  virtual auto Delete(DocumentRequest request)
-      -> futures::future<std::optional<std::string>> = 0;
-
-  static void RegisterHandler(HttpServer& server, std::shared_ptr<DocumentAPI> api) {
-    server.resource["^/document/([^/]+)$"]["GET"] =
-        [api](std::shared_ptr<HttpServer::Response> response,
-              std::shared_ptr<HttpServer::Request> request) {
-          futures::capture_into_future([api, request] {
-            return api->Get(request);
-          }).finally([response = std::move(response)](expect::expected<std::optional<std::string>> v) noexcept {
-            try {
-              if (auto value = v.unwrap(); value) {
-                response->write(SimpleWeb::StatusCode::success_ok, value.value());
-              } else {
-                response->write(SimpleWeb::StatusCode::client_error_not_found);
-              }
-            } catch (std::exception const& e) {
-              response->write(SimpleWeb::StatusCode::server_error_internal_server_error,
-                              e.what());
-            } catch (...) {
-              response->write(SimpleWeb::StatusCode::server_error_internal_server_error);
-            }
-          });
-        };
-
-    server.resource["^/document/([^/]+)$"]["POST"] =
-        [api](std::shared_ptr<HttpServer::Response> response,
-              std::shared_ptr<HttpServer::Request> request) {
-          response->write(SimpleWeb::StatusCode::server_error_internal_server_error,
-                          "not implemented");
-        };
-
-    server.resource["^/document/([^/]+)$"]["DELETE"] =
-        [api](std::shared_ptr<HttpServer::Response> response,
-              std::shared_ptr<HttpServer::Request> request) {
-          response->write(SimpleWeb::StatusCode::server_error_internal_server_error,
-                          "not implemented");
-        };
-  }
-};
 
 void RegisterReplicationHandler(HttpServer& server,
                                 std::shared_ptr<rlog::ReplicatedLogReplicationAPI> api) {
@@ -203,16 +120,6 @@ void RegisterAppendHandler(HttpServer& server,
   };
 }
 
-struct SimpleDocumentAPI : DocumentAPI {
-  futures::future<std::optional<std::string>> Get(DocumentRequest request) override {
-    return futures::make_fulfilled_promise<std::optional<std::string>>(std::in_place,
-                                                                       std::nullopt);
-  }
-
-  futures::future<std::optional<std::string>> Put(DocumentPutRequest request) override {}
-  futures::future<std::optional<std::string>> Delete(DocumentRequest request) override {}
-};
-
 struct HTTPError : std::exception {
   explicit HTTPError(SimpleWeb::error_code error) : error(error) {}
 
@@ -279,8 +186,8 @@ struct RemoteLogParticipant : rlog::ParticipantAPI {
 };
 
 struct LocalLogParticipant : rlog::ParticipantAPI {
-  explicit LocalLogParticipant(std::string key_prefix, std::shared_ptr<rocksdb::DB> db)
-      : key_prefix(std::move(key_prefix)), db(std::move(db)) {}
+  explicit LocalLogParticipant(std::string key_prefix, std::shared_ptr<RocksDBHandle> db)
+      : key_prefix(std::move(key_prefix)), rocks(std::move(db)) {}
 
   futures::future<rlog::AppendEntriesResult> appendEntries(const rlog::AppendEntriesRequest& req) override {
     rocksdb::WriteBatch batch;
@@ -291,13 +198,13 @@ struct LocalLogParticipant : rlog::ParticipantAPI {
 
       std::cout << "Writing " << e->get().index << " " << e->get().term << std::endl;
 
-      batch.Put(key.str(),
+      batch.Put(rocks->logs.get(), key.str(),
                 rocksdb::Slice(reinterpret_cast<const char*>(e->get().payload.data()),
                                e->get().payload.size()));
     }
     rocksdb::WriteOptions write_opts;
     write_opts.sync = true;  // can we do this async?
-    db->Write(write_opts, &batch);
+    rocks->db->Write(write_opts, &batch);
     std::cout << "Sync done" << std::endl;
     return futures::make_fulfilled_promise<rlog::AppendEntriesResult>(std::in_place,
                                                                       req.term, true);
@@ -305,7 +212,7 @@ struct LocalLogParticipant : rlog::ParticipantAPI {
 
  private:
   std::string key_prefix;
-  std::shared_ptr<rocksdb::DB> db;
+  std::shared_ptr<RocksDBHandle> rocks;
 };
 
 int main(int argc, char* argv[]) {
@@ -316,7 +223,7 @@ int main(int argc, char* argv[]) {
   std::cout << "trollolol" << std::endl;
   auto ctx = std::make_shared<Context>();
   std::cout << "opening rocksdb at " << argv[1] << std::endl;
-  ctx->db = OpenRocksDB(argv[1]);
+  ctx->rocks = OpenRocksDB(argv[1]);
 
   std::cout << "listening at port " << argv[2] << std::endl;
 
@@ -328,15 +235,7 @@ int main(int argc, char* argv[]) {
 
   auto scheduler = std::make_shared<sched::scheduler>();
 
-  using namespace std::chrono_literals;
-
-  scheduler
-      ->delay(
-          5s, [](int x) { return 2 * x; }, 12)
-      .finally([](expected<int>&& e) noexcept {
-        std::cout << e.unwrap() << std::endl;
-      });
-
+/*
   std::vector<std::shared_ptr<rlog::ParticipantAPI>> parts;
 
   for (size_t i = 3; i < argc; i++) {
@@ -344,7 +243,7 @@ int main(int argc, char* argv[]) {
     parts.push_back(std::make_shared<RemoteLogParticipant>(argv[i]));
   }
 
-  parts.push_back(std::make_shared<LocalLogParticipant>("log/", ctx->db));
+  parts.push_back(std::make_shared<LocalLogParticipant>("log/", ctx->rocks));
   auto log = std::make_shared<rlog::ReplicatedLog>(parts, scheduler);
 
   RegisterAppendHandler(server, log);
@@ -357,9 +256,6 @@ int main(int argc, char* argv[]) {
     threads.emplace_back([&] { scheduler->run(); });
   }
 
-  auto doc_api = std::make_shared<SimpleDocumentAPI>();
-  DocumentAPI::RegisterHandler(server, doc_api);
-
-  server.start();
+  server.start();*/
   return EXIT_SUCCESS;
 }

@@ -1,16 +1,26 @@
 #ifndef PROTOTYPE_SCHEDULER_H
 #define PROTOTYPE_SCHEDULER_H
 #include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <tuple>
 #include <utility>
 
 #include "futures.h"
+#include "priority-queue.h"
 
 namespace sched {
 
 struct scheduler {
+  /**
+   * Asynchronously calls a function with the supplied parameters and returns a future containing the result.
+   * If the provided functions returns a future, the futures are joined. Exceptions are captured by the future.
+   *
+   * @param f callable type with signature `(args...)`.
+   * @param args arguments used to invoke `f`.
+   * @return future providing the result of the call `f(args...)`.
+   */
   template <typename F, typename... Args, std::enable_if_t<std::is_invocable_v<F, Args...>, int> = 0,
             typename S = std::invoke_result_t<F, Args...>, typename R = futures::detail::future_base_type_t<S>>
   auto async(F&& f, Args&&... args) -> futures::future<R> {
@@ -44,6 +54,15 @@ struct scheduler {
     }
   }
 
+  template <typename T, typename... Args>
+  void fulfill_async(futures::promise<T>&& p, Args&&... args) {
+    post(
+        [p = std::move(p)](Args&&... args) {
+          std::move(p).fulfill(std::forward<Args>(args)...);
+        },
+        std::forward<Args>(args)...);
+  }
+
   using clock = std::chrono::steady_clock;
 
   template <typename Rep, typename Period, typename F, typename... Args,
@@ -61,7 +80,7 @@ struct scheduler {
                                  std::move(p).capture(
                                      [&] { return std::apply(f, args); });
                                });
-
+    std::abort();  // delayed_task_queue is never popped
     return std::move(ff);
   }
 
@@ -88,8 +107,8 @@ struct scheduler {
     {
       std::unique_lock guard(mutex);
       is_stopping = true;
+      cv.notify_all();
     }
-    cv.notify_all();
   }
 
  private:

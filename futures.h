@@ -16,6 +16,13 @@ template <typename T>
 struct promise;
 
 template <typename T>
+struct is_future : std::false_type {};
+template <typename T>
+struct is_future<future<T>> : std::true_type {};
+template <typename T>
+inline constexpr auto is_future_v = is_future<T>::value;
+
+template <typename T>
 auto make_promise() -> std::pair<future<T>, promise<T>>;
 template <typename T>
 future<T> make_fulfilled_promise(expected<T> e);
@@ -27,12 +34,9 @@ future<T> make_failed_promise(Args&&... args);
 template <typename T>
 future<T> make_failed_promise(std::exception_ptr ptr);
 
+
 template <typename T>
-struct is_future : std::false_type {};
-template <typename T>
-struct is_future<future<T>> : std::true_type {};
-template <typename T>
-inline constexpr auto is_future_v = is_future<T>::value;
+future<T> join(future<future<T>>&&);
 
 namespace detail {
 
@@ -59,8 +63,8 @@ struct shared_state {
   }
   explicit shared_state(expected<T> e)
       : _state(state::VALUE), _store(std::move(e)) {}
-  explicit shared_state(std::exception_ptr ptr) : _state(state::VALUE) {
-    new (&_store) expected<T>(std::move(ptr));
+  explicit shared_state(const std::exception_ptr& ptr) : _state(state::VALUE) {
+    new (&_store) expected<T>(ptr);
   }
 
   ~shared_state() {
@@ -137,7 +141,7 @@ struct shared_base {
   // make this protected
   shared_state_ptr<T> extract() && { return std::move(_shared_state); }
 
-  bool is_active() const { return _shared_state != nullptr; }
+  [[nodiscard]] bool is_active() const { return _shared_state != nullptr; }
 
  protected:
  private:
@@ -184,7 +188,7 @@ struct future_base : detail::shared_base<T> {
           // fulfill with this error
           std::move(p).fulfill(r.error());
         } else {
-          auto state = std::move(r).get().extract();
+          auto state = std::move(r).unwrap().extract();
           if (state == nullptr) {
             std::move(p).template throw_into<std::runtime_error>(
                 "future in bad state");
@@ -212,6 +216,30 @@ struct future_base : detail::shared_base<T> {
       std::move(state).set_callback(std::move(f));
     });
   }
+
+  template <typename E, typename... Args>
+  auto throw_nested(Args&&... args) -> future<T> {
+    return std::move(*this).then(
+        [args = std::make_tuple(std::forward<Args>(args)...)](expected<T>&& e) mutable {
+          try {
+            return std::move(e).unwrap();
+          } catch (...) {
+            std::throw_with_nested(std::make_from_tuple<E>(std::move(args)));
+          }
+        });
+  }
+
+  template <typename E, typename F, typename... Args>
+  auto throw_nested_if(Args&&... args) -> future<T> {
+    return std::move(*this).then(
+        [args = std::make_tuple(std::forward<Args>(args)...)](expected<T>&& e) mutable {
+          try {
+            return e.get();
+          } catch (F const& e) {
+            std::throw_with_nested(std::make_from_tuple<E>(std::move(args)));
+          }
+        });
+  }
 };
 
 template <typename T>
@@ -221,8 +249,8 @@ struct promise_base : shared_base<T> {
   promise_base(promise_base const&) = delete;
   promise_base& operator=(promise_base const&) = delete;
 
-  promise_base(promise_base&&) = default;
-  promise_base& operator=(promise_base&&) = default;
+  promise_base(promise_base&&) noexcept = default;
+  promise_base& operator=(promise_base&&) noexcept = default;
   ~promise_base() {
     if (this->is_active()) {
       std::terminate();
@@ -326,6 +354,15 @@ struct future : detail::future_base<T> {
 template <>
 struct future<void> : detail::future_base<void> {
   using detail::future_base<void>::future_base;
+
+  template <typename F, std::enable_if_t<std::is_invocable_v<F>, int> = 0,
+            typename S = std::invoke_result_t<F>, typename R = detail::future_base_type_t<S>>
+  auto and_then(F&& f) && -> future<R> {
+    return std::move(*this).then([f = std::forward<F>(f)](expected<void>&& e) {
+      e.rethrow_error();
+      return std::invoke(f);
+    });
+  }
 };
 
 template <typename T>
@@ -403,6 +440,38 @@ auto capture_into_future(F&& f, Args&&... args) -> future<R> {
   } catch (...) {
     return make_failed_promise<R>(std::current_exception());
   }
+}
+
+template <typename T>
+future<T> join(future<future<T>>&& ff) {
+  return std::move(ff).then(
+      [](expected<future<T>>&& ef) noexcept { return std::move(ef).get(); });
+}
+
+template <typename Iter, std::enable_if_t<is_future_v<typename Iter::value_type>, int> = 0,
+    typename R = typename Iter::value_type::base_type>
+auto fan_in(Iter begin, Iter end) -> future<std::vector<expected<R>>> {
+  using result_vector = std::vector<expected<R>>;
+
+  struct Context {
+    promise<result_vector> p;
+    result_vector v;
+    ~Context() { std::move(p).fulfill(std::in_place, std::move(v)); }
+    Context(promise<result_vector> p, std::size_t size)
+        : p(std::move(p)), v(size) {}
+  };
+
+  auto&& [f, p] = make_promise<result_vector>();
+  auto ctx = std::make_shared<Context>(std::move(p), std::distance(begin, end));
+
+  std::size_t index = 0;
+  for (auto it = begin; it != end; it++) {
+    std::move(*it).finally([ctx, index = index++](auto&& e) noexcept {
+      ctx->v[index] = std::move(e);
+    });
+  }
+
+  return std::move(f);
 }
 
 }  // namespace futures
